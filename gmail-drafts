@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""gmail-drafts: read Gmail and write drafts, and nothing else.
+
+A command-line tool for agents such as n8n Nod. It can search and read mail, save attachments and create or
+update drafts. It has no command and no code path that sends, deletes, trashes, archives or labels mail: every
+Gmail API call goes through `Gmail.call`, which refuses any method and path outside ALLOWED. Google has no
+permission for "drafts but not send" (gmail.compose covers both), so this allowlist is the limit.
+
+Credentials come from the environment and are never printed:
+  GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET   an OAuth client of type "Desktop app"
+  GMAIL_REFRESH_TOKEN                    from `gmail-drafts auth`, run once by the account owner
+
+Commands (all print JSON):
+  profile                               the account's address (Nod's connection test)
+  search QUERY [--max N] [--page TOKEN] messages matching a Gmail search, newest first
+  read ID [--max-chars N]               one message: headers, text, attachment list
+  thread ID [--max-chars N]             every message in a thread
+  attachment MSG_ID ATT_ID --out PATH   save one attachment to a new file
+  drafts [--max N]                      existing drafts
+  draft-create [--reply-to ID] [--to ..] [--cc ..] [--subject ..] (--body TEXT | --body-file PATH) [--attach PATH]
+  draft-update DRAFT_ID (same options)  replace a draft's content
+  auth                                  one-time sign-in on your own computer; copies the refresh token
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import email.policy
+import email.utils
+import hashlib
+import html
+import json
+import mimetypes
+import os
+import re
+import secrets
+import socket
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from email.message import EmailMessage
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+__version__ = "1.0.0"
+
+API = "https://gmail.googleapis.com/gmail/v1/users/me/"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+SCOPES = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose"
+MAX_ATTACH = 20 << 20          # Gmail's own limit for a message is 25 MB, base64 adds a third
+ID = r"(?!send\b)[A-Za-z0-9_-]{1,128}"   # "send" is never an id: drafts/send is the send call
+
+# The only Gmail API calls this tool makes. Sending (drafts/send, messages/send), deleting, trashing and
+# label changes are deliberately absent.
+ALLOWED = [
+    ("GET", re.compile(r"profile")),
+    ("GET", re.compile(r"messages")),
+    ("GET", re.compile(rf"messages/{ID}")),
+    ("GET", re.compile(rf"messages/{ID}/attachments/{ID}")),
+    ("GET", re.compile(rf"threads/{ID}")),
+    ("GET", re.compile(r"drafts")),
+    ("GET", re.compile(rf"drafts/{ID}")),
+    ("POST", re.compile(r"drafts")),
+    ("PUT", re.compile(rf"drafts/{ID}")),
+]
+
+
+class Refused(Exception):
+    pass
+
+
+class ToolError(Exception):
+    pass
+
+
+def allowed(method: str, path: str) -> bool:
+    return any(method == m and rx.fullmatch(path) for m, rx in ALLOWED)
+
+
+def http_json(method: str, url: str, body: bytes | None = None, headers: dict | None = None) -> dict:
+    req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read())
+            msg = detail.get("error_description") or detail.get("error", {}).get("message") or detail.get("error")
+        except Exception:
+            msg = None
+        raise ToolError(f"{method} {url.split('?')[0].replace(API, '')}: HTTP {e.code}{': ' + str(msg) if msg else ''}")
+    except urllib.error.URLError as e:
+        raise ToolError(f"network error: {e.reason}")
+
+
+class Gmail:
+    def __init__(self, client_id: str, client_secret: str, refresh_token: str, transport=http_json):
+        self.creds = (client_id, client_secret, refresh_token)
+        self.transport = transport
+        self.access = None
+
+    def token(self) -> str:
+        if not self.access:
+            cid, secret, refresh = self.creds
+            body = urllib.parse.urlencode({"client_id": cid, "client_secret": secret, "refresh_token": refresh,
+                                           "grant_type": "refresh_token"}).encode()
+            got = self.transport("POST", TOKEN_URL, body, {"Content-Type": "application/x-www-form-urlencoded"})
+            if not got.get("access_token"):
+                raise ToolError("Google returned no access token; run `gmail-drafts auth` again")
+            self.access = got["access_token"]
+        return self.access
+
+    def call(self, method: str, path: str, params: dict | None = None, body: dict | None = None) -> dict:
+        if not allowed(method, path):
+            raise Refused(f"{method} {path} is not a read or draft call")
+        url = API + path + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Authorization": f"Bearer {self.token()}"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        return self.transport(method, url, data, headers)
+
+
+# ---- reading ----
+
+def header(msg: dict, name: str) -> str:
+    for h in msg.get("payload", {}).get("headers", []):
+        if h.get("name", "").lower() == name.lower():
+            return h.get("value", "")
+    return ""
+
+
+def b64(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def walk(part: dict):
+    yield part
+    for p in part.get("parts", []) or []:
+        yield from walk(p)
+
+
+def html_to_text(s: str) -> str:
+    s = re.sub(r"(?is)<(script|style|head)\b.*?</\1>", " ", s)
+    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>|</h\d>", "\n", s)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html.unescape(s).replace("\xa0", " ")
+    s = re.sub(r"[ \t\r\f\v]+", " ", s)
+    return re.sub(r"\n\s*\n\s*", "\n\n", s).strip()
+
+
+def decode(part: dict) -> str:
+    data = part.get("body", {}).get("data")
+    if not data:
+        return ""
+    raw = b64(data)
+    charset = "utf-8"
+    for h in part.get("headers", []) or []:
+        if h.get("name", "").lower() == "content-type":
+            m = re.search(r'charset="?([\w.-]+)', h.get("value", ""), re.I)
+            if m:
+                charset = m.group(1)
+    try:
+        return raw.decode(charset, "replace")
+    except LookupError:
+        return raw.decode("utf-8", "replace")
+
+
+def body_text(msg: dict) -> str:
+    parts = list(walk(msg.get("payload", {})))
+    plain = [decode(p) for p in parts if p.get("mimeType") == "text/plain" and not p.get("filename")]
+    if any(t.strip() for t in plain):
+        return "\n".join(plain).strip()
+    rich = [decode(p) for p in parts if p.get("mimeType") == "text/html" and not p.get("filename")]
+    return html_to_text("\n".join(rich))
+
+
+def attachments(msg: dict) -> list:
+    out = []
+    for p in walk(msg.get("payload", {})):
+        if p.get("filename") and p.get("body", {}).get("attachmentId"):
+            out.append({"name": p["filename"], "mimeType": p.get("mimeType"), "size": p["body"].get("size"),
+                        "attachmentId": p["body"]["attachmentId"]})
+    return out
+
+
+def summary(msg: dict) -> dict:
+    return {"id": msg["id"], "threadId": msg.get("threadId"), "date": header(msg, "Date"),
+            "from": header(msg, "From"), "to": header(msg, "To"), "subject": header(msg, "Subject"),
+            "snippet": html.unescape(msg.get("snippet", "")), "labels": msg.get("labelIds", [])}
+
+
+def full(msg: dict, max_chars: int) -> dict:
+    text = body_text(msg)
+    out = summary(msg)
+    out.update({"cc": header(msg, "Cc"), "replyTo": header(msg, "Reply-To"),
+                "messageIdHeader": header(msg, "Message-ID"),
+                "text": text[:max_chars], "truncated": len(text) > max_chars, "attachments": attachments(msg)})
+    return out
+
+
+def search(g: Gmail, query: str, limit: int, page: str | None) -> dict:
+    params = {"q": query, "maxResults": limit}
+    if page:
+        params["pageToken"] = page
+    listing = g.call("GET", "messages", params)
+    meta = {"format": "metadata", "metadataHeaders": ["From", "To", "Subject", "Date"]}
+    found = [summary(g.call("GET", f"messages/{check_id(m['id'])}", meta)) for m in listing.get("messages", [])]
+    return {"messages": found, "nextPage": listing.get("nextPageToken")}
+
+
+def check_id(value: str) -> str:
+    if not re.fullmatch(ID, value or ""):
+        raise ToolError(f"not a Gmail id: {value!r}")
+    return value
+
+
+def save_attachment(g: Gmail, msg_id: str, att_id: str, out: str) -> dict:
+    data = b64(g.call("GET", f"messages/{check_id(msg_id)}/attachments/{check_id(att_id)}")["data"])
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)   # never replaces a file
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return {"saved": out, "bytes": len(data)}
+
+
+# ---- drafts ----
+
+def build(args, original: dict | None) -> EmailMessage:
+    m = EmailMessage(policy=email.policy.SMTP)
+    to = args.to or (original and (header(original, "Reply-To") or header(original, "From")))
+    if not to:
+        raise ToolError("a draft needs --to, or --reply-to with a message to answer")
+    m["To"] = to
+    if args.cc:
+        m["Cc"] = args.cc
+    subject = args.subject
+    if subject is None and original:
+        subject = header(original, "Subject")
+        if not re.match(r"(?i)\s*(re|aw)\s*:", subject):
+            subject = "Re: " + subject
+    m["Subject"] = subject or ""
+    if original:
+        ref = header(original, "Message-ID")
+        if ref:
+            m["In-Reply-To"] = ref
+            m["References"] = (header(original, "References") + " " + ref).strip()
+    if args.body_file:
+        with open(args.body_file, encoding="utf-8") as f:
+            body = f.read()
+    else:
+        body = args.body or ""
+    m.set_content(body)
+    total = 0
+    for path in args.attach or []:
+        with open(path, "rb") as f:
+            data = f.read()
+        total += len(data)
+        if total > MAX_ATTACH:
+            raise ToolError("attachments are larger than 20 MB in total")
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        main, sub = ctype.split("/", 1)
+        m.add_attachment(data, maintype=main, subtype=sub, filename=os.path.basename(path))
+    return m
+
+
+def draft_body(g: Gmail, args) -> dict:
+    original = None
+    if args.reply_to:
+        original = g.call("GET", f"messages/{check_id(args.reply_to)}", {"format": "full"})
+    raw = base64.urlsafe_b64encode(build(args, original).as_bytes()).decode()
+    message = {"raw": raw}
+    if original:
+        message["threadId"] = original.get("threadId")
+    return {"message": message}
+
+
+def draft_result(d: dict) -> dict:
+    return {"draftId": d.get("id"), "messageId": d.get("message", {}).get("id"),
+            "threadId": d.get("message", {}).get("threadId"), "note": "Saved as a draft. Nothing was sent."}
+
+
+def list_drafts(g: Gmail, limit: int) -> dict:
+    out = []
+    for d in g.call("GET", "drafts", {"maxResults": limit}).get("drafts", []):
+        full_d = g.call("GET", f"drafts/{check_id(d['id'])}", {"format": "metadata"})
+        msg = full_d.get("message", {})
+        out.append({"draftId": d["id"], "messageId": msg.get("id"), "to": header(msg, "To"),
+                    "subject": header(msg, "Subject"), "snippet": html.unescape(msg.get("snippet", ""))})
+    return {"drafts": out}
+
+
+# ---- one-time sign-in, run by the account owner on their own computer ----
+
+def auth(client_id: str, client_secret: str) -> dict:
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(24)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    redirect = f"http://127.0.0.1:{port}"
+    got: dict = {}
+
+    class Back(BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            got.update({k: v[0] for k, v in q.items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("Done. You can close this tab.".encode())
+
+        def log_message(self, *a):
+            pass
+
+    url = AUTH_URL + "?" + urllib.parse.urlencode({
+        "client_id": client_id, "redirect_uri": redirect, "response_type": "code", "scope": SCOPES,
+        "access_type": "offline", "prompt": "consent", "state": state,
+        "code_challenge": challenge, "code_challenge_method": "S256"})
+    server = HTTPServer(("127.0.0.1", port), Back)
+    print("Opening Google sign-in in your browser. If it does not open, visit:\n" + url, file=sys.stderr)
+    webbrowser.open(url)
+    while "code" not in got and "error" not in got:
+        server.handle_request()
+    server.server_close()
+    if got.get("state") != state:
+        raise ToolError("sign-in answer did not match this request")
+    if "error" in got:
+        raise ToolError(f"sign-in failed: {got['error']}")
+    tok = http_json("POST", TOKEN_URL, urllib.parse.urlencode({
+        "client_id": client_id, "client_secret": client_secret, "code": got["code"], "code_verifier": verifier,
+        "redirect_uri": redirect, "grant_type": "authorization_code"}).encode(),
+        {"Content-Type": "application/x-www-form-urlencoded"})
+    refresh = tok.get("refresh_token")
+    if not refresh:
+        raise ToolError("Google returned no refresh token")
+    granted = set(tok.get("scope", "").split())
+    extra = granted - set(SCOPES.split())
+    try:
+        subprocess.run(["pbcopy"], input=refresh.encode(), check=True)
+        where = "copied to the clipboard"
+    except (OSError, subprocess.CalledProcessError):
+        path = os.path.expanduser("~/gmail-drafts-refresh-token.txt")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(refresh + "\n")
+        where = f"written to {path} (delete it after pasting)"
+    return {"refreshToken": where, "scopes": sorted(granted), "extraScopes": sorted(extra)}
+
+
+# ---- command line ----
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="gmail-drafts", description="Read Gmail and write drafts. Never sends.")
+    p.add_argument("--version", action="version", version=__version__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("profile", help="the account's address")
+    s = sub.add_parser("search", help="messages matching a Gmail search, newest first")
+    s.add_argument("query")
+    s.add_argument("--max", type=int, default=10)
+    s.add_argument("--page")
+    for name in ("read", "thread"):
+        r = sub.add_parser(name, help=f"one {'message' if name == 'read' else 'thread'} with its text")
+        r.add_argument("id")
+        r.add_argument("--max-chars", type=int, default=20000)
+    a = sub.add_parser("attachment", help="save one attachment to a new file")
+    a.add_argument("message_id")
+    a.add_argument("attachment_id")
+    a.add_argument("--out", required=True)
+    d = sub.add_parser("drafts", help="existing drafts")
+    d.add_argument("--max", type=int, default=10)
+    for name in ("draft-create", "draft-update"):
+        c = sub.add_parser(name, help="create a draft" if name == "draft-create" else "replace a draft")
+        if name == "draft-update":
+            c.add_argument("draft_id")
+        c.add_argument("--reply-to", help="id of the message this draft answers")
+        c.add_argument("--to")
+        c.add_argument("--cc")
+        c.add_argument("--subject")
+        body = c.add_mutually_exclusive_group(required=True)
+        body.add_argument("--body")
+        body.add_argument("--body-file")
+        c.add_argument("--attach", action="append", help="a file to attach; repeat for more")
+    sub.add_parser("auth", help="one-time sign-in on your own computer")
+    return p
+
+
+def env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise ToolError(f"{name} is not set")
+    return value
+
+
+def run(argv: list[str], transport=http_json) -> dict:
+    args = parser().parse_args(argv)
+    if args.cmd == "auth":   # asks for the client instead of taking it on the command line, out of shell history
+        import getpass
+        cid = os.environ.get("GMAIL_CLIENT_ID") or input("OAuth client ID: ").strip()
+        secret = os.environ.get("GMAIL_CLIENT_SECRET") or getpass.getpass("OAuth client secret (hidden): ").strip()
+        return auth(cid, secret)
+    g = Gmail(env("GMAIL_CLIENT_ID"), env("GMAIL_CLIENT_SECRET"), env("GMAIL_REFRESH_TOKEN"), transport)
+    limit = lambda n: max(1, min(n, 50))
+    if args.cmd == "profile":
+        p = g.call("GET", "profile")
+        return {"email": p.get("emailAddress"), "messages": p.get("messagesTotal"), "canSend": False}
+    if args.cmd == "search":
+        return search(g, args.query, limit(args.max), args.page)
+    if args.cmd == "read":
+        return full(g.call("GET", f"messages/{check_id(args.id)}", {"format": "full"}), args.max_chars)
+    if args.cmd == "thread":
+        t = g.call("GET", f"threads/{check_id(args.id)}", {"format": "full"})
+        return {"threadId": t.get("id"), "messages": [full(m, args.max_chars) for m in t.get("messages", [])]}
+    if args.cmd == "attachment":
+        return save_attachment(g, args.message_id, args.attachment_id, args.out)
+    if args.cmd == "drafts":
+        return list_drafts(g, limit(args.max))
+    if args.cmd == "draft-create":
+        return draft_result(g.call("POST", "drafts", body=draft_body(g, args)))
+    if args.cmd == "draft-update":
+        return draft_result(g.call("PUT", f"drafts/{check_id(args.draft_id)}", body=draft_body(g, args)))
+    raise ToolError(f"unknown command {args.cmd}")
+
+
+def main() -> int:
+    try:
+        print(json.dumps(run(sys.argv[1:]), ensure_ascii=False, indent=1))
+        return 0
+    except (ToolError, Refused, OSError) as e:
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
