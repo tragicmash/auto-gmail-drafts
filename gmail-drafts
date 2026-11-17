@@ -44,7 +44,7 @@ import webbrowser
 from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 API = "https://gmail.googleapis.com/gmail/v1/users/me/"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -80,6 +80,19 @@ def allowed(method: str, path: str) -> bool:
     return any(method == m and rx.fullmatch(path) for m, rx in ALLOWED)
 
 
+def google_error(detail) -> str | None:
+    """Google's reason for a refusal. The token endpoint answers {"error": "invalid_grant", "error_description": ..},
+    the Gmail API {"error": {"code": .., "message": ..}}."""
+    if not isinstance(detail, dict):
+        return None
+    err = detail.get("error")
+    if isinstance(err, dict):
+        return err.get("message") or err.get("status")
+    if isinstance(err, str):
+        return err + (f" ({detail['error_description']})" if detail.get("error_description") else "")
+    return None
+
+
 def http_json(method: str, url: str, body: bytes | None = None, headers: dict | None = None) -> dict:
     req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
     try:
@@ -87,9 +100,8 @@ def http_json(method: str, url: str, body: bytes | None = None, headers: dict | 
             return json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         try:
-            detail = json.loads(e.read())
-            msg = detail.get("error_description") or detail.get("error", {}).get("message") or detail.get("error")
-        except Exception:
+            msg = google_error(json.loads(e.read()))
+        except ValueError:
             msg = None
         raise ToolError(f"{method} {url.split('?')[0].replace(API, '')}: HTTP {e.code}{': ' + str(msg) if msg else ''}")
     except urllib.error.URLError as e:
@@ -390,7 +402,13 @@ def parser() -> argparse.ArgumentParser:
 
 
 def env(name: str) -> str:
+    """A credential from the environment. Run by hand in a terminal, the tool asks for a missing one instead,
+    hiding secrets, so a local test needs no secret on the command line or in shell history."""
     value = os.environ.get(name, "").strip()
+    if not value and sys.stdin.isatty():
+        import getpass
+        prompt = f"{name}: "
+        value = (input(prompt) if name.endswith("_ID") else getpass.getpass(prompt + "(hidden) ")).strip()
     if not value:
         raise ToolError(f"{name} is not set")
     return value
@@ -398,11 +416,8 @@ def env(name: str) -> str:
 
 def run(argv: list[str], transport=http_json) -> dict:
     args = parser().parse_args(argv)
-    if args.cmd == "auth":   # asks for the client instead of taking it on the command line, out of shell history
-        import getpass
-        cid = os.environ.get("GMAIL_CLIENT_ID") or input("OAuth client ID: ").strip()
-        secret = os.environ.get("GMAIL_CLIENT_SECRET") or getpass.getpass("OAuth client secret (hidden): ").strip()
-        return auth(cid, secret)
+    if args.cmd == "auth":
+        return auth(env("GMAIL_CLIENT_ID"), env("GMAIL_CLIENT_SECRET"))
     g = Gmail(env("GMAIL_CLIENT_ID"), env("GMAIL_CLIENT_SECRET"), env("GMAIL_REFRESH_TOKEN"), transport)
     limit = lambda n: max(1, min(n, 50))
     if args.cmd == "profile":

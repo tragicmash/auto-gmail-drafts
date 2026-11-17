@@ -194,6 +194,16 @@ class Drafts(Base):
         self.assertEqual({m for m, _ in self.gmail_calls()}, {"GET", "PUT"})
 
 
+class Errors(unittest.TestCase):
+    def test_google_reasons_are_shown(self):
+        self.assertEqual(gd.google_error({"error": "invalid_grant", "error_description": "Bad Request"}),
+                         "invalid_grant (Bad Request)")
+        self.assertEqual(gd.google_error({"error": "invalid_client"}), "invalid_client")
+        self.assertEqual(gd.google_error({"error": {"code": 403, "message": "Gmail API has not been used"}}),
+                         "Gmail API has not been used")
+        self.assertIsNone(gd.google_error(["odd"]))
+
+
 class Credentials(Base):
     def test_missing_variable(self):
         os.environ.pop("GMAIL_REFRESH_TOKEN")
